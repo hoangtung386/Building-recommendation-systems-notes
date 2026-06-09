@@ -1,74 +1,76 @@
-Spotify challenge
-=================
+# Spotify — Million Playlist Dataset: Playlist Continuation
 
-In this directory we explore the Million Playlist Dataset from Spotify
+An embedding-based retrieval model that predicts which tracks come next given a playlist context (first 5 tracks), using album and artist embeddings with contrastive learning.
 
-Relevant links:
+**Reference:** [Spotify Million Playlist Dataset](https://www.aicrowd.com/challenges/spotify-million-playlist-dataset-challenge)
 
-* [Spotify Blog](https://research.atspotify.com/2020/09/the-million-playlist-dataset-remastered/)
+## Setup
 
-* [Dataset location](https://www.aicrowd.com/challenges/spotify-million-playlist-dataset-challenge/dataset_files)
+```bash
+conda create -n esrecsys python=3.11 -y
+conda activate esrecsys
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install wandb absl-py numpy
 
-Setup
-=====
-
-Please download the million playlist data set and challenge into a directory called data
-
-```
-mkdir data
-mkdir spotify_million_playlist_dataset
-mkdir spotify_million_playlist_dataset_challenge
-
-# Download both zip files using a browser into data
-
-
-cd spotify_million_playlist_dataset_challenge
-unzip ../spotify_million_playlist_dataset_challenge.zip
-
-cd ../spotify_million_playlist_dataset
-unzip ../spotify_million_dataset.zip
-
+cd spotify
+pip install -r requirements.txt
 ```
 
-spotify_million_dataset.zip should be unpacked into data/spotify_million_playlist_dataset
-spotify_million_dataset_challenge.zip should be unpacked into data/spotify_million_playlist_dataset_challenge
+## Data
 
-If you wish to install the GPU version of Jax please run
+Download the Million Playlist Dataset from [AIcrowd](https://www.aicrowd.com/challenges/spotify-million-playlist-dataset-challenge/dataset_files):
 
-pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+```bash
+mkdir -p data/spotify_million_playlist_dataset
+mkdir data/spotify_million_playlist_dataset_challenge
 
-Making the dictionaries
-=======================
+# Unpack into the directories above
+```
 
-python3 make_dictionary.py --playlists=data/spotify_million_playlist_dataset/data/mpd.slice*.json --output=data/dictionaries
+## Data Preparation
 
-A copy has been uploaded to weights and biases
+Build dictionaries from playlist JSON files:
 
-wandb artifact put -n "recsys-spotify/dictionaries" -d "Dictionaries for tracks, arists and albums" -t "dictionaries" dictionaries
+```bash
+python make_dictionary.py \
+  --playlists=data/spotify_million_playlist_dataset/data/mpd.slice*.json \
+  --output=data/dictionaries
+```
 
-To fetch it run
+Generate training data (JSONL format):
 
-wandb artifact get --type "dictionaries" recsys-spotify/dictionaries
+```bash
+python make_training.py \
+  --playlists=data/spotify_million_playlist_dataset/data/mpd.slice.*.json \
+  --dictionaries=data/dictionaries \
+  --output=data/training
+```
 
-Making the training data
-========================
+Pre-built dictionaries can be fetched from W&B:
 
-python3 make_training.py --playlists=data/spotify_million_playlist_dataset/data/mpd.slice.*.json --dictionaries=data/dictionaries
+```bash
+wandb artifact get --type dictionaries recsys-spotify/dictionaries
+```
 
-It should dump the following from the dictionaries that tell you how many of each URI is in the data:
+## Training
 
-2262292 tracks loaded
-295860 artists loaded
-734684 albums loaded
+```bash
+python train_spotify.py \
+  --train_pattern="data/training/00??[0-8].jsonl" \
+  --test_pattern="data/training/00??9.jsonl" \
+  --all_tracks=data/training/all_tracks.json \
+  --dictionaries=data/dictionaries \
+  --num_negatives=64 \
+  --learning_rate=1e-3 \
+  --momentum=0.98 \
+  --feature_size=32 \
+  --max_steps=100000
+```
 
-A copy has been uploaded to weights and biases
+## Architecture
 
-wandb artifact put -n "recsys-spotify/training" -d "Tensorflow example training" -t "tfrecord" training
-
-To fetch it run
-wandb artifact get --type "tfrecord" recsys-spotify/training
-
-You might then have to move it to training or change the path
-e.g.
-
- mv data/artifacts/training\:v1/* data/training
+- **Track embedding**: `concat(album_embedding, artist_embedding)` via hash embedding tables
+- **Score**: Max dot-product of context embeddings with candidate embeddings + album/artist bonus
+- **Loss**: Mean triplet + extremal triplet + L2 regularization + self-affinity penalties
+- **Optimizer**: SGD with momentum
+- **Evaluation**: Recall@500 for tracks and artists
