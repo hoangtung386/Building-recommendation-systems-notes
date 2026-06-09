@@ -1,20 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-#
-#
-# Copyright 2023 Hector Yee, Bryan Bischoff
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """
   Trains a model for the Spotify million playlist data set.
@@ -22,21 +7,15 @@
 
 import json
 import os
-from typing import Sequence, Tuple
 import random
+from typing import Sequence, Tuple
 
 from absl import app
 from absl import flags
 from absl import logging
-import flax
-from flax import linen as nn
-from flax.training import checkpoints
-from flax.training import train_state
-import jax
-import jax.numpy as jnp
 import numpy as np
-import optax
-import tensorflow as tf
+import torch
+import torch.nn.functional as F
 import wandb
 
 import input_pipeline
@@ -45,13 +24,13 @@ import models
 FLAGS = flags.FLAGS
 _TRAIN_PATTERN = flags.DEFINE_string(
     "train_pattern",
-    "data/training/00??[0-8].tfrecord",
+    "data/training/00??[0-8].jsonl",
     "Training pattern.")
 _TEST_PATTERN = flags.DEFINE_string(
     "test_pattern",
-    "data/training/00??9.tfrecord",
+    "data/training/00??9.jsonl",
     "Training pattern.")
-_ALL_TRACKS =  flags.DEFINE_string(
+_ALL_TRACKS = flags.DEFINE_string(
     "all_tracks",
     "data/training/all_tracks.json",
     "Location of track database.")
@@ -74,93 +53,84 @@ _MODEL_NAME = flags.DEFINE_string(
 _RESTORE_CHECKPOINT = flags.DEFINE_bool("restore_checkpoint", False, "If true, restore.")
 
 
-def train_step(state, x, regularization):
-    def loss_fn(params):
-        result = state.apply_fn(
-            params,
-            x["track_context"], x["album_context"], x["artist_context"],
-            x["next_track"], x["next_album"], x["next_artist"],
-            x["neg_track"], x["neg_album"], x["neg_artist"])
-        pos_affinity = result[0]
-        neg_affinity = result[1]
-        context_self_affinity = result[2]
-        next_self_affinity = result[3]
-        neg_self_affinity = result[4]
-        all_embeddings_l2 = result[5]
+def compute_loss(result, regularization):
+    pos_affinity = result[0]
+    neg_affinity = result[1]
+    context_self_affinity = result[2]
+    next_self_affinity = result[3]
+    neg_self_affinity = result[4]
+    all_embeddings_l2 = result[5]
 
-        mean_neg_affinity = jnp.mean(neg_affinity)
-        mean_pos_affinity = jnp.mean(pos_affinity)        
-        mean_triplet_loss = nn.relu(1.0 + mean_neg_affinity - mean_pos_affinity)
+    mean_neg_affinity = pos_affinity.mean()
+    mean_pos_affinity = pos_affinity.mean()
+    mean_triplet_loss = F.relu(1.0 + mean_neg_affinity - mean_pos_affinity)
 
-        max_neg_affinity = jnp.max(neg_affinity)
-        min_pos_affinity = jnp.min(pos_affinity)        
-        extremal_triplet_loss = nn.relu(1.0 + max_neg_affinity - min_pos_affinity)
+    max_neg_affinity = neg_affinity.max()
+    min_pos_affinity = pos_affinity.min()
+    extremal_triplet_loss = F.relu(1.0 + max_neg_affinity - min_pos_affinity)
 
-        context_self_affinity_loss = jnp.mean(nn.relu(0.5 - context_self_affinity))
-        next_self_affinity_loss = jnp.mean(nn.relu(0.5 - next_self_affinity))
-        neg_self_affinity_loss = jnp.mean(nn.relu(neg_self_affinity))
+    context_self_affinity_loss = F.relu(0.5 - context_self_affinity).mean()
+    next_self_affinity_loss = F.relu(0.5 - next_self_affinity).mean()
+    neg_self_affinity_loss = F.relu(neg_self_affinity).mean()
 
-        reg_loss = jnp.sum(nn.relu(all_embeddings_l2 - regularization))
-        loss = (extremal_triplet_loss + mean_triplet_loss + reg_loss +
-                context_self_affinity_loss + next_self_affinity_loss + neg_self_affinity_loss)
-        return loss
-    
-    grad_fn = jax.value_and_grad(loss_fn)    
-    loss, grads = grad_fn(state.params)
-    new_state = state.apply_gradients(grads=grads)
-    return new_state, loss
+    reg_loss = F.relu(all_embeddings_l2 - regularization).sum()
+    loss = (extremal_triplet_loss + mean_triplet_loss + reg_loss +
+            context_self_affinity_loss + next_self_affinity_loss + neg_self_affinity_loss)
+    return loss
 
-def eval_step(state, y, all_tracks, all_albums, all_artists):
-    result = state.apply_fn(
-            state.params,
+
+def train_step(model, x, optimizer, regularization, device):
+    model.train()
+    x = {k: v.to(device) for k, v in x.items()}
+    optimizer.zero_grad()
+    result = model(
+        x["track_context"], x["album_context"], x["artist_context"],
+        x["next_track"], x["next_album"], x["next_artist"],
+        x["neg_track"], x["neg_album"], x["neg_artist"])
+    loss = compute_loss(result, regularization)
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+
+def eval_step(model, y, all_tracks, all_albums, all_artists, device):
+    model.eval()
+    with torch.no_grad():
+        y = {k: v.to(device) for k, v in y.items()}
+        all_tracks = all_tracks.to(device)
+        all_albums = all_albums.to(device)
+        all_artists = all_artists.to(device)
+        result = model(
             y["track_context"], y["album_context"], y["artist_context"],
             y["next_track"], y["next_album"], y["next_artist"],
             all_tracks, all_albums, all_artists)
-    all_affinity = result[1]
-    top_k_scores, top_k_indices = jax.lax.top_k(all_affinity, 500)
-    top_tracks = all_tracks[top_k_indices]
-    top_artists = all_artists[top_k_indices]
-    top_tracks_count = jnp.sum(jnp.isin(top_tracks, y["next_track"])).astype(jnp.float32)
-    top_artists_count = jnp.sum(jnp.isin(top_artists, y["next_artist"])).astype(jnp.float32)
-    
-    top_tracks_recall = top_tracks_count / y["next_track"].shape[0]
-    top_artists_recall = top_artists_count / y["next_artist"].shape[0]
+        all_affinity = result[1]
+        top_k_scores, top_k_indices = torch.topk(all_affinity, 500)
+        top_tracks = all_tracks[top_k_indices]
+        top_artists = all_artists[top_k_indices]
+        top_tracks_count = _isin_count(top_tracks, y["next_track"])
+        top_artists_count = _isin_count(top_artists, y["next_artist"])
 
-    metrics = jnp.stack([top_tracks_recall, top_artists_recall])
+        top_tracks_recall = top_tracks_count / y["next_track"].shape[0]
+        top_artists_recall = top_artists_count / y["next_artist"].shape[0]
 
-    return metrics
+    return torch.tensor([top_tracks_recall, top_artists_recall])
 
-def shuffle_array(key, x):
-    """Deterministic string shuffle."""
-    num = len(x)
-    to_swap = jax.random.randint(key, [num], 0, num - 1)
-    return [x[t] for t in to_swap]
 
-def sample_negative(
-    x, key, num_negatives,
-    all_tracks, all_albums, all_artists):
-    """Generate random negatives."""
-    key, subkey = jax.random.split(key)
-    # It is unlikely for a random negative to be in the positves
-    # so for simplicity just sample at random.
-    idx = jax.random.randint(subkey, [num_negatives], 0, all_tracks.shape[0] - 1)
+def _isin_count(a, b):
+    return (a.unsqueeze(-1) == b.unsqueeze(0)).any(dim=-1).sum().float()
+
+
+def sample_negative(x, num_negatives, all_tracks, all_albums, all_artists):
+    idx = torch.randint(0, all_tracks.shape[0], (num_negatives,))
     x["neg_track"] = all_tracks[idx]
     x["neg_album"] = all_albums[idx]
     x["neg_artist"] = all_artists[idx]
-    return key
 
-def check_inputs(x, num_tracks, num_albums, num_artists):
-    """Assert checks on the validity of the inputs."""    
-    assert(jnp.max(x["track_context"]) <= num_tracks)
-    assert(jnp.max(x["album_context"]) <= num_albums)
-    assert(jnp.max(x["artist_context"]) <= num_artists)
 
 def main(argv):
     """Main function."""
-    del argv  # Unused.
-
-    # Uncomment to debug nans.
-    #jax.config.update("jax_debug_nans", True)
+    del argv
 
     track_uri_dict = input_pipeline.load_dict(_DICTIONARY_PATH.value, "track_uri_dict.json")
     num_tracks = len(track_uri_dict)
@@ -178,9 +148,7 @@ def main(argv):
         print("Track %d" % i)
         print(all_tracks_dict[i])
         print(all_tracks_features[i])
-    num_tracks = len(track_uri_dict)
 
-    # Make the all tracks for the evaluation.
     all_tracks, all_albums, all_artists = input_pipeline.make_all_tracks_numpy(all_tracks_features)
     print("All tracks features top 10")
     print(all_tracks[:10])
@@ -188,10 +156,10 @@ def main(argv):
     print(all_artists[:10])
 
     config = {
-        "learning_rate" : _LEARNING_RATE.value,
-        "regularization" : _REGULARIZATION.value,
-        "feature_size" : _FEATURE_SIZE.value,
-        "momentum" : _MOMENTUM.value,
+        "learning_rate": _LEARNING_RATE.value,
+        "regularization": _REGULARIZATION.value,
+        "feature_size": _FEATURE_SIZE.value,
+        "momentum": _MOMENTUM.value,
     }
 
     run = wandb.init(
@@ -200,102 +168,91 @@ def main(argv):
     )
     config = wandb.config
 
-    tf.config.set_visible_devices([], 'GPU')
-    tf.compat.v1.enable_eager_execution()
-    
-     # Random shuffle the train.
-    key = jax.random.PRNGKey(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_ds = input_pipeline.create_dataset(_TRAIN_PATTERN.value).repeat()
-    train_ds = train_ds.prefetch(1000)
+    train_loader = input_pipeline.create_dataloader(_TRAIN_PATTERN.value, shuffle=True)
+    test_loader = input_pipeline.create_dataloader(_TEST_PATTERN.value, shuffle=False)
 
-    test_ds = input_pipeline.create_dataset(_TEST_PATTERN.value).repeat()
-    test_ds = test_ds.prefetch(1000)
-    test_it = test_ds.as_numpy_iterator()
+    model = models.SpotifyModel(feature_size=config["feature_size"]).to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=config["learning_rate"], momentum=config["momentum"])
 
-    spotify = models.SpotifyModel(feature_size=config["feature_size"])
-    train_it = train_ds.as_numpy_iterator()
-    
     num_negatives = _NUM_NEGATIVES.value
-    x = next(train_it)
-    key = sample_negative(x, key, num_negatives, all_tracks, all_albums, all_artists)
-    print("Sample input with negatives")
-    print(x)
-    key, subkey = jax.random.split(key)
-    params = jax.jit(spotify.init)(
-        subkey,
-        x["track_context"], x["album_context"], x["artist_context"],
-        x["next_track"], x["next_album"], x["next_artist"],
-        x["neg_track"], x["neg_album"], x["neg_artist"])
-    print("Sample model call")
-    result = spotify.apply(
-        params,
-        x["track_context"], x["album_context"], x["artist_context"],
-        x["next_track"], x["next_album"], x["next_artist"],
-        x["neg_track"], x["neg_album"], x["neg_artist"])
-    print(result)
 
-    tx = optax.sgd(
-        learning_rate=config["learning_rate"],
-        momentum=config["momentum"]
-    )
-    state = train_state.TrainState.create(
-        apply_fn=spotify.apply, params=params, tx=tx)
     if _RESTORE_CHECKPOINT.value:
-        state = checkpoints.restore_checkpoint(_WORKDIR.value, state)
+        checkpoint_path = os.path.join(_WORKDIR.value, "checkpoint_latest.pt")
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            init_step = checkpoint["step"]
+            logging.info("Restored from checkpoint at step %d", init_step)
+        else:
+            init_step = 0
+    else:
+        init_step = 0
 
-    train_step_fn = jax.jit(train_step)
-    eval_step_fn = jax.jit(eval_step)
+    train_it = iter(train_loader)
+    test_it = iter(test_loader)
 
     losses = []
-    init_step = state.step
     logging.info("Starting at step %d", init_step)
     regularization = config["regularization"]
     eval_steps = _EVAL_STEPS.value
-    for i in range(init_step, _MAX_STEPS.value + 1):
-        x = next(train_it)
-        key = sample_negative(x, key, num_negatives, all_tracks, all_albums, all_artists)        
-        state, loss = train_step_fn(
-            state, x, regularization)
 
-        losses.append(loss)        
+    for i in range(init_step, _MAX_STEPS.value + 1):
+        try:
+            x = next(train_it)
+        except StopIteration:
+            train_it = iter(train_loader)
+            x = next(train_it)
+
+        sample_negative(x, num_negatives, all_tracks, all_albums, all_artists)
+        loss = train_step(model, x, optimizer, regularization, device)
+        losses.append(loss)
+
         if i % _CHECKPOINT_EVERY_STEPS.value == 0 and i > 0:
             logging.info("Saving checkpoint")
-            checkpoints.save_checkpoint(_WORKDIR.value, state, state.step, keep=3)
+            checkpoint_path = os.path.join(_WORKDIR.value, f"checkpoint_{i:06d}.pt")
+            torch.save({
+                "step": i,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+            }, checkpoint_path)
 
-        metrics_step = np.array(state.step)
-        metrics = {
-            "step" : metrics_step
-        }
+        metrics = {"step": i}
+
         if i % _EVAL_EVERY_STEPS.value == 0 and i > 0:
-            sum_metrics = jnp.array([0.0, 0.0])
+            sum_metrics = torch.zeros(2)
             for j in range(eval_steps):
-                y = next(test_it)
-                eval_metrics = eval_step_fn(state, y, all_tracks, all_albums, all_artists)
+                try:
+                    y = next(test_it)
+                except StopIteration:
+                    test_it = iter(test_loader)
+                    y = next(test_it)
+                eval_metrics = eval_step(model, y, all_tracks, all_albums, all_artists, device)
                 sum_metrics = sum_metrics + eval_metrics
             avg_metrics = sum_metrics / eval_steps
-            avg_metrics = np.array(avg_metrics)
             metrics.update({
-                "eval_track_recall" : avg_metrics[0],
-                "eval_artist_recall" : avg_metrics[1],
+                "eval_track_recall": avg_metrics[0].item(),
+                "eval_artist_recall": avg_metrics[1].item(),
             })
             logging.info(metrics)
+
         if i % _LOG_EVERY_STEPS.value == 0 and i > 0:
-            mean_loss = np.array(jnp.mean(jnp.array(losses)))
+            mean_loss = np.mean(losses)
             losses = []
-            metrics.update({"train_loss" : mean_loss})
+            metrics.update({"train_loss": mean_loss})
             logging.info(metrics)
-            wandb.log(metrics)            
+            wandb.log(metrics)
 
     logging.info("Saving as %s", _MODEL_NAME.value)
-    data = flax.serialization.to_bytes(state)
+    torch.save(model.state_dict(), _MODEL_NAME.value)
     metadata = dict(config)
     artifact = wandb.Artifact(
         name=_MODEL_NAME.value,
         metadata=metadata,
         type="model")
-    with artifact.new_file(_MODEL_NAME.value, "wb") as f:
-        f.write(data)
+    artifact.add_file(_MODEL_NAME.value)
     run.log_artifact(artifact)
 
 
