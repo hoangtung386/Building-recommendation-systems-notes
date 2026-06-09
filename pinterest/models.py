@@ -1,74 +1,81 @@
-# Copyright 2022 Hector Yee, Bryan Bischoff
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Models for the shop the look content recommender."""
 
-from functools import partial
-from typing import Any, Callable, Sequence, Tuple
+from typing import Sequence, Tuple
 
-from flax import linen as nn
-import jax.numpy as jnp
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 
 class CNN(nn.Module):
     """Simple CNN."""
-    filters : Sequence[int]
-    output_size : int
 
-    @nn.compact
-    def __call__(self, x, train: bool = True):        
-        for filter in self.filters:
-            # Stride 2 downsamples 2x.
-            residual = nn.Conv(filter, (3, 3), (2, 2))(x)
-            x = nn.Conv(filter, (3, 3), (2, 2))(x)            
-            x = nn.BatchNorm(use_running_average=not train, use_bias=False)(x)
-            x = nn.swish(x)
-            x = nn.Conv(filter, (1, 1), (1, 1))(x)
-            x = nn.BatchNorm(use_running_average=not train, use_bias=False)(x)
-            x = nn.swish(x)
-            x = nn.Conv(filter, (1, 1), (1, 1))(x)
-            x = nn.BatchNorm(use_running_average=not train, use_bias=False)(x)
+    def __init__(self, filters: Sequence[int], output_size: int):
+        super().__init__()
+        self.blocks = nn.ModuleList()
+        in_channels = 3
+        for f in filters:
+            block = nn.ModuleDict({
+                "residual_conv": nn.Conv2d(in_channels, f, kernel_size=3, stride=2, padding=1),
+                "conv1": nn.Conv2d(in_channels, f, kernel_size=3, stride=2, padding=1),
+                "bn1": nn.BatchNorm2d(f),
+                "conv2": nn.Conv2d(f, f, kernel_size=1, stride=1),
+                "bn2": nn.BatchNorm2d(f),
+                "conv3": nn.Conv2d(f, f, kernel_size=1, stride=1),
+                "bn3": nn.BatchNorm2d(f),
+            })
+            self.blocks.append(block)
+            in_channels = f
+        self.fc = nn.Linear(in_channels, output_size)
+
+    def forward(self, x: torch.Tensor, train: bool = True) -> torch.Tensor:
+        for block in self.blocks:
+            residual = block["residual_conv"](x)
+            x = block["conv1"](x)
+            x = block["bn1"](x) if train else block["bn1"](x)
+            x = F.silu(x)
+            x = block["conv2"](x)
+            x = block["bn2"](x) if train else block["bn2"](x)
+            x = F.silu(x)
+            x = block["conv3"](x)
+            x = block["bn3"](x) if train else block["bn3"](x)
             x = x + residual
-            # Average pool downsamples 2x.
-            x = nn.avg_pool(x, (3, 3), strides=(2, 2), padding="SAME")
-        x = jnp.mean(x, axis=(1, 2))
-        x = nn.Dense(self.output_size, dtype=jnp.float32)(x)
+            x = F.avg_pool2d(x, kernel_size=3, stride=2, padding=1)
+        x = x.mean(dim=(2, 3))
+        x = self.fc(x)
         return x
+
 
 class STLModel(nn.Module):
     """Shop the look model that takes in a scene and item and computes a score for them."""
-    output_size : int
 
-    def setup(self):
+    def __init__(self, output_size: int):
+        super().__init__()
         default_filter = [16, 32, 64, 128]
-        self.scene_cnn = CNN(filters=default_filter, output_size=self.output_size)
-        self.product_cnn = CNN(filters=default_filter, output_size=self.output_size)
+        self.scene_cnn = CNN(filters=default_filter, output_size=output_size)
+        self.product_cnn = CNN(filters=default_filter, output_size=output_size)
 
-    def get_scene_embed(self, scene):
-        return self.scene_cnn(scene, False)
+    def get_scene_embed(self, scene: torch.Tensor) -> torch.Tensor:
+        self.scene_cnn.eval()
+        return self.scene_cnn(scene, train=False)
 
-    def get_product_embed(self, product):
-        return self.product_cnn(product, False)
+    def get_product_embed(self, product: torch.Tensor) -> torch.Tensor:
+        self.product_cnn.eval()
+        return self.product_cnn(product, train=False)
 
-    def __call__(self, scene, pos_product, neg_product, train: bool = True):
+    def forward(
+        self,
+        scene: torch.Tensor,
+        pos_product: torch.Tensor,
+        neg_product: torch.Tensor,
+        train: bool = True,
+    ) -> Tuple[torch.Tensor, ...]:
         scene_embed = self.scene_cnn(scene, train)
 
         pos_product_embed = self.product_cnn(pos_product, train)
-        pos_score = scene_embed * pos_product_embed
-        pos_score = jnp.sum(pos_score, axis=-1)
+        pos_score = (scene_embed * pos_product_embed).sum(dim=-1)
 
         neg_product_embed = self.product_cnn(neg_product, train)
-        neg_score = scene_embed * neg_product_embed
-        neg_score = jnp.sum(neg_score, axis=-1)
+        neg_score = (scene_embed * neg_product_embed).sum(dim=-1)
 
         return pos_score, neg_score, scene_embed, pos_product_embed, neg_product_embed
