@@ -42,4 +42,4 @@ See each sub-project's README for data preparation and training instructions.
 
 ## License
 
-Apache 2.0 — see individual file headers.
+Apache 2.0 — see [LICENSE](LICENSE).
