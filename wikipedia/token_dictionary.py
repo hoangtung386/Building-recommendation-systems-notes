@@ -110,7 +110,7 @@ class TokenDictionary:
         return self.__token_stat[token_index].token
 
     def get_token_from_embedding_index(self, embedding_index):
-        if embedding_index is 0:
+        if embedding_index == 0:
             return "NULL"
         elif embedding_index <= self.get_dictionary_size():
             return self.get_token(embedding_index - 1)
